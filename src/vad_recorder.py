@@ -1,4 +1,5 @@
 import msvcrt
+import queue
 import threading
 from math import gcd
 
@@ -183,10 +184,20 @@ class SileroVADRecorder:
         self.audio_buffer = []
         self.vad_buffer = np.array([], dtype=np.float32)
         self.pre_speech_buffer = []
-        self._stop = threading.Event()
-        # Samples (at 16 kHz) to drop at the start of each turn while the mic
-        # spins up. Reset per turn in record_until_silence().
+        # Samples (at 16 kHz) to drop at the start of each turn while the VAD
+        # state settles. Reset per turn when the recorder is armed.
         self._prime_left = 0
+
+        # Persistent-stream machinery. The mic stream is opened ONCE and kept
+        # running for the whole session, so no turn ever pays device-open
+        # latency (the old cause of the first utterance being missed). The audio
+        # thread only detects speech while _armed is set, and hands finished
+        # utterances back to the main thread through a queue.
+        self._stream = None
+        self._armed = threading.Event()
+        self._reset_pending = False
+        self._force_end = False
+        self._utterances = queue.Queue()
 
         # Per-device fields, set by _apply_device().
         self.device = None
@@ -196,22 +207,18 @@ class SileroVADRecorder:
         self.channels = None
         self._up = self._down = 1
 
-        # Warm up the model + audio device so the FIRST spoken turn is not the
-        # slow cold one (which used to drop the start of speech).
+        # Prime the model, then open the persistent stream so audio is already
+        # flowing before the first turn (kills the cold-start miss).
         self._warmup()
+        self._ensure_stream()
 
     def _warmup(self):
-        # 1) Prime the Silero model: its very first inference is the slow, lazy
-        #    one. Run a few dummy 512-sample frames, then clear state.
+        # Silero's very first inference is the slow, lazy one - run a few dummy
+        # 512-sample frames now so it isn't paid mid-utterance.
         dummy = torch.zeros(512, dtype=torch.float32)
         for _ in range(5):
             self.vad_iterator(dummy, return_seconds=True)
         self.vad_iterator.reset_states()
-        # 2) Prime the mic: the first device open on a process has extra latency
-        #    and can drop initial frames. Open+read one candidate now, discard it.
-        for c in self.candidates:
-            if _peak_level(c["index"], c["rate"], c["channels"], seconds=0.3) >= 0:
-                break
 
     def _prefer_live_candidates(self, floor=5e-4):
         """Reorder candidates so a mic that actually carries signal wins.
@@ -245,16 +252,46 @@ class SileroVADRecorder:
             return mono.astype(np.float32)
         return resample_poly(mono, self._up, self._down).astype(np.float32)
 
+    def _finish_utterance(self):
+        """Package the captured audio and hand it to the main thread.
+
+        Runs on the audio thread. Clears recording state, resets the VAD for
+        the next turn, and disarms so the stream idles until re-armed.
+        """
+        if self.is_recording and self.audio_buffer:
+            utt = np.concatenate(self.audio_buffer)
+        else:
+            utt = np.zeros(0, dtype=np.float32)  # nothing captured (e.g. early key press)
+        self.is_recording = False
+        self.audio_buffer = []
+        self.vad_iterator.reset_states()
+        self._force_end = False
+        self._armed.clear()
+        self._utterances.put(utt)
+
     def _make_callback(self):
         def callback(indata, frames, time, status):
             if status:
                 print(status)
 
+            # The stream runs continuously; only detect speech while armed.
+            if not self._armed.is_set():
+                return
+
+            # First armed callback of a turn: clear buffers and VAD state.
+            if self._reset_pending:
+                self.vad_iterator.reset_states()
+                self.is_recording = False
+                self.audio_buffer = []
+                self.vad_buffer = np.array([], dtype=np.float32)
+                self.pre_speech_buffer = []
+                self._prime_left = int(0.15 * self.vad_sample_rate)
+                self._reset_pending = False
+
             mono_16000 = self._to_16k(indata)
 
-            # Drop the first ~200 ms of each turn: the mic/host API spin-up can
-            # emit a burst or drop frames, which otherwise confuses the VAD on
-            # the first utterance. Human reaction time covers this gap anyway.
+            # Drop a little audio right after arming so a settling transient
+            # doesn't false-trigger the VAD; reaction time covers this gap.
             if self._prime_left > 0:
                 drop = min(self._prime_left, len(mono_16000))
                 self._prime_left -= drop
@@ -267,6 +304,11 @@ class SileroVADRecorder:
             while len(self.vad_buffer) >= 512:
                 vad_chunk = self.vad_buffer[:512]
                 self.vad_buffer = self.vad_buffer[512:]
+
+                # Manual stop (key press) finalizes the current audio immediately.
+                if self._force_end:
+                    self._finish_utterance()
+                    return
 
                 # keep small audio before speech starts
                 if not self.is_recording:
@@ -286,8 +328,7 @@ class SileroVADRecorder:
 
                     if "end" in speech:
                         print("Speech ended")
-                        self.is_recording = False
-                        self._stop.set()
+                        self._finish_utterance()
                         return
 
                 if self.is_recording:
@@ -328,44 +369,70 @@ class SileroVADRecorder:
         msg.append("then run again. The app will capture via the default-input router.")
         raise RuntimeError("\n".join(msg))
 
-    def record_until_silence(self, output_path="audio/user_input.wav"):
-        self.vad_iterator.reset_states()
-        self.is_recording = False
-        self.audio_buffer = []
-        self.vad_buffer = np.array([], dtype=np.float32)
-        self.pre_speech_buffer = []
-        self._stop.clear()
-        self._prime_left = int(0.2 * self.vad_sample_rate)  # ~200 ms spin-up drop
-
-        stream = self._open_stream()
+    def _ensure_stream(self):
+        """Open the persistent capture stream once and keep it running."""
+        if self._stream is not None:
+            return
+        self._stream = self._open_stream()
         router = any(k in self.device_name.lower() for k in DEFAULT_ROUTING_NAMES)
         print(f"Using device: {self.device_name} [{self.hostapi}] @ {self.mic_sample_rate} Hz")
         if router:
             print("(routing to your Windows Default recording device)")
+
+    def _drain_utterances(self):
+        try:
+            while True:
+                self._utterances.get_nowait()
+        except queue.Empty:
+            pass
+
+    def close(self):
+        """Stop and release the microphone stream."""
+        self._armed.clear()
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            finally:
+                self._stream = None
+
+    def record_until_silence(self, output_path="audio/user_input.wav"):
+        self._ensure_stream()
+
+        # Fresh turn: drop anything captured between turns, flush stray keys,
+        # then arm. The audio thread does the buffer/VAD reset on its first
+        # armed callback (avoids touching VAD state from two threads).
+        self._drain_utterances()
+        while msvcrt.kbhit():
+            msvcrt.getch()
+        self._force_end = False
+        self._reset_pending = True
+        self._armed.set()
+
         print("Listening... speak now, or press any key to stop.")
 
-        try:
-            # Poll until VAD signals end-of-speech OR the user presses a key.
-            while not self._stop.is_set():
-                if msvcrt.kbhit():
-                    msvcrt.getch()  # consume the keystroke
-                    print("Stopped by key press.")
-                    self.is_recording = False
-                    self._stop.set()
-                    break
-                sd.sleep(50)
-        finally:
-            stream.stop()
-            stream.close()
+        # Wait for the audio thread to deliver a finished utterance, while
+        # watching for a key press that forces an early stop.
+        utt = None
+        while True:
+            if msvcrt.kbhit():
+                msvcrt.getch()
+                print("Stopped by key press.")
+                self._force_end = True
+            try:
+                utt = self._utterances.get(timeout=0.05)
+                break
+            except queue.Empty:
+                continue
 
-        # Stream is closed here, so the callback no longer touches the buffers.
-        chunks = self.audio_buffer if self.audio_buffer else self.pre_speech_buffer
-        if not chunks:
+        self._armed.clear()  # callback already disarmed; belt and suspenders
+
+        if utt is None or utt.size == 0:
             print("No speech captured. (If you spoke, your mic level may be silent - "
                   "check that your earbuds are the Windows Default recording device.)")
             return None
 
-        audio_data = np.concatenate(chunks)
+        audio_data = utt
 
         # Guard against a "working" device that carries no real signal (e.g. a
         # Line In jack with nothing plugged in, or a mic Windows isn't routing).

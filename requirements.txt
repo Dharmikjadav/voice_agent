@@ -1,0 +1,5 @@
+silero-vad
+sounddevice
+numpy
+torch
+scipy

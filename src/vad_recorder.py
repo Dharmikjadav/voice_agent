@@ -451,6 +451,16 @@ class SileroVADRecorder:
         if self.clean_audio:
             audio_data = denoise(audio_data, self.vad_sample_rate)
 
+        # Normalize to a consistent level (~-3 dBFS) so Whisper gets a well-
+        # scaled signal even when the Windows mic gain is low. Gain is capped so
+        # a near-silent take isn't blown up into pure noise.
+        cur_peak = float(np.max(np.abs(audio_data))) if audio_data.size else 0.0
+        if cur_peak > 0:
+            gain = min(10 ** (-3.0 / 20.0) / cur_peak, 10 ** (45.0 / 20.0))
+            audio_data = audio_data * gain
+            print(f"Level: {20 * np.log10(cur_peak + 1e-9):.1f} dBFS -> "
+                  f"normalized (+{20 * np.log10(gain):.1f} dB)")
+
         write(
             output_path,
             self.vad_sample_rate,

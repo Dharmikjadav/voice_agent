@@ -34,6 +34,24 @@ def _probe_open(index, samplerate, channels):
         return False
 
 
+def _peak_level(index, samplerate, channels, seconds=0.25):
+    """Peak amplitude over a short read; -1.0 if the device cannot open.
+
+    A live mic always has a small noise floor; a dead / unrouted input (an
+    unplugged Line In, or a default-router with no default device) returns
+    essentially digital zero. This lets us avoid recording pure silence.
+    """
+    try:
+        frames = max(1024, int(seconds * samplerate))
+        with sd.InputStream(device=index, samplerate=samplerate,
+                            channels=min(channels, 2), dtype="float32",
+                            blocksize=1024) as stream:
+            data, _ = stream.read(frames)
+        return float(np.max(np.abs(data)))
+    except Exception:
+        return -1.0
+
+
 def list_input_candidates(hints=DEFAULT_MIC_HINTS):
     """All input devices, ranked best-first for speech capture.
 
@@ -115,12 +133,27 @@ class SileroVADRecorder:
         # clean_audio=False to keep the raw mic audio.
         self.clean_audio = clean_audio
 
-        # Build the ordered list of devices to try. An explicit `device` index
-        # pins to that one; otherwise auto-rank and probe.
+        # Build the ordered list of devices to try:
+        #   device=None       -> auto-rank all mics, preferring one with signal
+        #   device="onenus"   -> pin to input devices whose NAME contains this
+        #                        (stable across Bluetooth reconnects that shuffle
+        #                        indices; find the exact name via diagnose_mic.py)
+        #   device=12         -> pin to that exact index
         if device is None:
             self.candidates = list_input_candidates(mic_hints)
             if not self.candidates:
                 raise RuntimeError("No input (microphone) device found. Connect a mic and retry.")
+            self._prefer_live_candidates()
+        elif isinstance(device, str):
+            key = device.lower()
+            self.candidates = [c for c in list_input_candidates(mic_hints)
+                               if key in c["name"].lower()]
+            if not self.candidates:
+                raise RuntimeError(
+                    f"No input device name contains '{device}'. "
+                    f"Run 'python diagnose_mic.py' to see the exact mic names."
+                )
+            self._prefer_live_candidates()
         else:
             d = sd.query_devices(device)
             if int(d["max_input_channels"]) <= 0:
@@ -151,6 +184,9 @@ class SileroVADRecorder:
         self.vad_buffer = np.array([], dtype=np.float32)
         self.pre_speech_buffer = []
         self._stop = threading.Event()
+        # Samples (at 16 kHz) to drop at the start of each turn while the mic
+        # spins up. Reset per turn in record_until_silence().
+        self._prime_left = 0
 
         # Per-device fields, set by _apply_device().
         self.device = None
@@ -159,6 +195,39 @@ class SileroVADRecorder:
         self.mic_sample_rate = None
         self.channels = None
         self._up = self._down = 1
+
+        # Warm up the model + audio device so the FIRST spoken turn is not the
+        # slow cold one (which used to drop the start of speech).
+        self._warmup()
+
+    def _warmup(self):
+        # 1) Prime the Silero model: its very first inference is the slow, lazy
+        #    one. Run a few dummy 512-sample frames, then clear state.
+        dummy = torch.zeros(512, dtype=torch.float32)
+        for _ in range(5):
+            self.vad_iterator(dummy, return_seconds=True)
+        self.vad_iterator.reset_states()
+        # 2) Prime the mic: the first device open on a process has extra latency
+        #    and can drop initial frames. Open+read one candidate now, discard it.
+        for c in self.candidates:
+            if _peak_level(c["index"], c["rate"], c["channels"], seconds=0.3) >= 0:
+                break
+
+    def _prefer_live_candidates(self, floor=5e-4):
+        """Reorder candidates so a mic that actually carries signal wins.
+
+        Groups: 0 = live (noise floor above `floor`), 1 = opens but silent,
+        2 = cannot open. Stable within each group, so the existing tier order
+        (headset first, etc.) is preserved. This stops the app from picking a
+        device that opens fine but records pure silence.
+        """
+        scored = []
+        for pos, c in enumerate(self.candidates):
+            level = _peak_level(c["index"], c["rate"], c["channels"])
+            group = 2 if level < 0 else (0 if level >= floor else 1)
+            scored.append((group, pos, c))
+        scored.sort(key=lambda s: (s[0], s[1]))
+        self.candidates = [c for _, _, c in scored]
 
     def _apply_device(self, c):
         self.device = c["index"]
@@ -182,6 +251,17 @@ class SileroVADRecorder:
                 print(status)
 
             mono_16000 = self._to_16k(indata)
+
+            # Drop the first ~200 ms of each turn: the mic/host API spin-up can
+            # emit a burst or drop frames, which otherwise confuses the VAD on
+            # the first utterance. Human reaction time covers this gap anyway.
+            if self._prime_left > 0:
+                drop = min(self._prime_left, len(mono_16000))
+                self._prime_left -= drop
+                mono_16000 = mono_16000[drop:]
+                if mono_16000.size == 0:
+                    return
+
             self.vad_buffer = np.concatenate([self.vad_buffer, mono_16000])
 
             while len(self.vad_buffer) >= 512:
@@ -255,6 +335,7 @@ class SileroVADRecorder:
         self.vad_buffer = np.array([], dtype=np.float32)
         self.pre_speech_buffer = []
         self._stop.clear()
+        self._prime_left = int(0.2 * self.vad_sample_rate)  # ~200 ms spin-up drop
 
         stream = self._open_stream()
         router = any(k in self.device_name.lower() for k in DEFAULT_ROUTING_NAMES)

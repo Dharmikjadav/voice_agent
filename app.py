@@ -3,15 +3,16 @@ from src.whisper_cpp import transcribe_with_whisper_cpp
 
 
 def main():
-    # device=None -> auto-pick a microphone via a reliable host API and use its
-    # native sample rate. On this PC the Bluetooth earbud mic is only reachable
-    # through the Windows "Default recording device", so make sure your earbuds
-    # are set as the Default recording device in Windows Sound settings.
-    # Pass an index (e.g. device=12) to force a specific mic instead.
+    # Choosing the mic:
+    #   device=None          -> auto-pick; prefers a mic that actually has signal
+    #   device="onenus"      -> pin by NAME (survives Bluetooth index shuffles)
+    #   device=12            -> pin by exact index
+    # First run `python diagnose_mic.py`, speak when prompted, and use the name
+    # of the device that prints "*** HEARS YOUR VOICE ***" below.
     recorder = SileroVADRecorder()
 
     print("Voice agent started. Press CTRL + C to quit.")
-    print("Tip: set your earbuds as the Windows DEFAULT recording device.")
+    print("Tip: if it records silence, run 'python diagnose_mic.py' to find your mic.")
     print("Speak, then go silent (~1s) or press any key to end each turn.\n")
 
     while True:

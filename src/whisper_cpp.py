@@ -8,7 +8,7 @@ def clean_whisper_output(output: str) -> str:
     cleaned = []
 
     for line in lines:
-        # remove timestamps like: [00:00:00.000 --> 00:00:02.000]
+        # Remove timestamps
         line = re.sub(r"\[.*?-->\s*.*?\]", "", line).strip()
 
         if line:
@@ -27,13 +27,19 @@ def transcribe_with_whisper_cpp(audio_path):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Whisper model not found: {model_path}")
 
+    if not os.path.exists(audio_path):
+        raise FileNotFoundError(f"Audio file not found: {audio_path}")
+
     command = [
-        whisper_exe,
-        "-m", model_path,
-        "-f", audio_path,
-        "-nt",
-        "-np"
-    ]
+    whisper_exe,
+    "-m", model_path,
+    "-f", audio_path,
+    "-l", "en",
+    "--prompt",
+    "This is a clear English conversation between a user and an AI voice assistant. The speech contains natural English sentences, questions, commands, and technical terms. Transcribe the speech accurately with correct punctuation and capitalization.",
+    "-nt",
+    "-np"
+]
 
     result = subprocess.run(
         command,
@@ -48,4 +54,11 @@ def transcribe_with_whisper_cpp(audio_path):
         print(result.stderr)
         return None
 
-    return clean_whisper_output(result.stdout)
+    # Extract only the transcription
+    text = clean_whisper_output(result.stdout)
+
+    if not text:
+        print("No Whisper text found")
+        return None
+
+    return text

@@ -3,3 +3,11 @@ sounddevice
 numpy
 torch
 scipy
+
+
+
+
+
+whisper_cpp\whisper-cli.exe -m whisper_cpp\models\ggml-base.en.bin -f audio\user_input.wav
+// only print text output, no timestamps
+whisper_cpp\whisper-cli.exe -m whisper_cpp\models\ggml-base.en.bin -f audio\user_input.wav -l en -nt -np 2>$null

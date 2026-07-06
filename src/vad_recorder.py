@@ -22,6 +22,11 @@ DEFAULT_ROUTING_NAMES = ("sound mapper", "primary sound capture")
 
 EXCLUDE_NAMES = ("stereo mix", "what u hear", "wave out mix", "loopback", "aux")
 
+# Only run noise reduction when the raw take is at least this loud. On a quiet
+# mic the spectral/noise gate can strip the faint speech itself, so quieter
+# takes are kept raw (safer for transcription). -25 dBFS peak.
+DENOISE_MIN_PEAK = 10 ** (-25.0 / 20.0)
+
 
 def _probe_open(index, samplerate, channels):
     """Return True if a capture stream on this device can actually start."""
@@ -448,8 +453,14 @@ class SileroVADRecorder:
             print("  or set your earbuds/headset as the Windows DEFAULT recording device.")
             return None
 
-        if self.clean_audio:
+        # Noise reduction, but only on loud-enough takes: on a quiet mic the
+        # gate can remove the speech itself, so quiet takes are left raw.
+        if self.clean_audio and peak >= DENOISE_MIN_PEAK:
             audio_data = denoise(audio_data, self.vad_sample_rate)
+            print("Noise reduction: applied.")
+        elif self.clean_audio:
+            print(f"Noise reduction: skipped (level {20 * np.log10(peak + 1e-9):.0f} "
+                  f"dBFS below -25 dBFS - kept raw to protect faint speech).")
 
         # Normalize to a consistent level (~-3 dBFS) so Whisper gets a well-
         # scaled signal even when the Windows mic gain is low. Gain is capped so
